@@ -24,7 +24,7 @@ From the repo root:
 docker compose up --build
 ```
 
-Compose publishes the app on port 4781 and Redis on port 6379. The app container uses `REDIS_URL=redis://redis:6379`. From the host, curl `http://127.0.0.1:4781` and test Redis on `127.0.0.1:6379`.
+Compose publishes the `api` service on port 4781 and Redis on port 6379. The `api` service uses `REDIS_URL=redis://redis:6379`. From the host, curl `http://127.0.0.1:4781` and test Redis on `127.0.0.1:6379`.
 
 The host in the warning is the host the process dialed. On the default local URL that is `127.0.0.1`. Inside Compose it is `redis`. A published-port check from the host can succeed while the app logs `host=redis` and `code=ENOTFOUND` when the app container is not on the Compose network.
 
@@ -54,7 +54,7 @@ X-Cache: MISS
 X-Cache-Reason: stored
 X-Cache-Key: offers:v1:delhi:2026-11-22:2026-11-24:2:inr
 X-Providers-Ok: atlas,nimbus
-X-Providers-Failed:
+X-Providers-Failed: -
 Cache-Control: no-store
 Server-Timing: app;dur=18
 ```
@@ -72,7 +72,7 @@ curl -sD - -o /dev/null \
 
 The second response carries `X-Cache: HIT`, `X-Cache-Reason: fresh`, and `X-Cache-Age` as a non-negative integer. The key header is unchanged. The body lists the same hotels, filtered and sorted for this request. Provider latency does not add to the second response.
 
-`GET` prints the stored JSON: `version`, `storedAt`, `ttlSeconds`, provider outcomes, dedupe counts, and the merged hotels. The value is the merge, not the raw provider payloads.
+`GET` prints the stored JSON: `version`, `storedAt`, `ttlSeconds`, `offersBeforeDedupe`, `providersQueried`, `providersOk`, `providersFailed`, and `offers`. The value is the merge, not the raw provider payloads. A Delhi stay has ten quotes and six cards. The Oberoi card is `delhi:the-oberoi`, provider `nimbus`, `totalPrice` 17200, `savingsVsNext` 1300.
 
 A request that uses only the default dates is the same check. On 2026-11-21 UTC the default key is the key above. The next UTC day changes the dates inside the key.
 
@@ -80,7 +80,7 @@ A request that uses only the default dates is the same check. On 2026-11-21 UTC 
 curl -sD - -o /dev/null 'http://127.0.0.1:4781/v1/offers?city=delhi'
 ```
 
-`meta.cache` in `/tmp/offers.json` repeats `X-Cache`, the reason, the key, and the age. Headers remain the wire contract.
+In `/tmp/offers.json`, `meta.cache` is the same string as `X-Cache`. `meta.cacheReason`, `meta.cacheKey`, and `meta.cacheAgeSeconds` repeat the other cache headers. Headers remain the wire contract.
 
 ## PowerShell
 
@@ -94,7 +94,7 @@ Test-NetConnection -ComputerName 127.0.0.1 -Port 6379
 
 The first call of a given default-date key returns `MISS` when Redis is up and the key was absent. The next call, after the first has returned, returns `HIT`. `TcpTestSucceeded` is `True` when port 6379 accepts a connection. The service emits the header name as `X-Cache`. PowerShell 7 looks that name up without case sensitivity.
 
-The JSON body is `$r.Content`. `meta.cache` matches `$r.Headers["X-Cache"]`.
+The JSON body is `$r.Content`. `meta.cache` is the same string as `$r.Headers["X-Cache"]`.
 
 ## Linux port check
 
@@ -126,18 +126,21 @@ Meaning: this request did not use a cached document and did not write one. The o
 
 The line is emitted once per failed `GET` or `SET` on a user request. Health scrapes do not emit it. A `failProvider` request skips Redis without this warning. Its header reason is `fault_injection`.
 
-A corrupt value logs a different warning, `cache payload corrupt; refreshing`, with the field `key`. That request overwrites the key and returns `MISS` / `refreshed_corrupt`.
+A corrupt value logs a different warning, `cache payload failed validation`, with the field `cacheKey`. That request overwrites the key and returns `MISS` / `refreshed_corrupt`.
+
+At boot, a failed ping logs `redis ping failed at startup; searches will bypass the cache until redis is reachable`, with the same host, port, and code. That line means the process is up and the next search will bypass. It is not a per-request skip. The client also logs `redis client error` at most once every five seconds. Grep the bypass message when you want the request that skipped the cache.
 
 ## Redis pill
 
-The desk at `GET /` shows a pill driven by `GET /health`, which the page requests on load and again when a search returns `redis_unreachable`.
+The desk at `GET /` shows a pill driven by `GET /health`. The page requests it on load, after every search, and every five seconds.
 
-| Pill | Health body | Meaning |
+| Pill text | Health body | Meaning |
 | --- | --- | --- |
-| `redis up` | `status: ok`, `redis: up` | Redis answered the ping. A search may be `HIT`, `MISS`, or `COALESCED`. |
-| `redis down` | `status: degraded`, `redis: down` | Redis did not answer. Search still returns offers. The cache chip reads `BYPASS`. |
+| `Redis up · <latencyMs> ms` | `status: ok`, `redis.ok: true` | Redis answered the ping. A search may be `HIT`, `MISS`, or `COALESCED`. |
+| `Redis down · cache bypassed · <code>` | `status: degraded`, `redis.ok: false` | Redis did not answer. `<code>` is `redis.code`, or `unreachable` when the body has none. Search still returns offers. The cache chip reads `BYPASS`. |
+| `Health check failed` | the fetch threw | The page could not read `/health`. |
 
-The pill is the Redis signal. It is not a cache-hit indicator, and it is not a gate. The process stays ready while the pill is down. The cache chip next to the results is `meta.cache`, which matches `X-Cache`: `HIT`, `MISS`, `BYPASS`, or `COALESCED`.
+The pill is the Redis signal. It is not a cache-hit indicator, and it is not a gate. The process stays ready while the pill is down. The cache chip next to the results is `meta.cache`, which matches `X-Cache`: `HIT`, `MISS`, `BYPASS`, or `COALESCED`. The line under it is `meta.cacheReason`.
 
 `BYPASS` with reason `fault_injection` means this search skipped the cache on purpose. The pill can still read `redis up`.
 
@@ -149,12 +152,12 @@ Boot fails, and the process does not listen, when a variable is set and fails it
 | --- | --- | --- |
 | `PORT` | `4781` | Integer 1–65535 |
 | `HOST` | `0.0.0.0` | Bind address |
-| `REDIS_URL` | `redis://127.0.0.1:6379` | A `redis://` URL. Userinfo is never logged. |
-| `CACHE_TTL_SECONDS` | `900` | Positive integer. Full results add jitter of 0–30 seconds. Partial results stay at 30 seconds and ignore this variable. |
-| `PROVIDER_TIMEOUT_MS` | `800` | Positive integer. Per provider. |
-| `MOCK_LATENCY_MS` | `120` | Integer `>= 0`. Set it above `PROVIDER_TIMEOUT_MS` to time a provider out. |
-| `LOG_LEVEL` | `info` | `fatal`, `error`, `warn`, `info`, `debug`, `trace` |
-| `NODE_ENV` | `development` | `development`, `test`, `production`. Production logs JSON. |
+| `REDIS_URL` | `redis://127.0.0.1:6379` | Non-empty string. Userinfo is never logged. |
+| `CACHE_TTL_SECONDS` | `900` | Integer 1–86400. Full results add jitter of 0–30 seconds. A partial result uses `min(30, this value)` and no jitter. |
+| `PROVIDER_TIMEOUT_MS` | `800` | Integer 20–10000. Per provider. |
+| `MOCK_LATENCY_MS` | `120` | Integer 0–5000. Set it above `PROVIDER_TIMEOUT_MS` to time a provider out. |
+| `LOG_LEVEL` | `info` | `fatal`, `error`, `warn`, `info`, `debug`, `trace`, `silent` |
+| `NODE_ENV` | `development` | Any string. JSON logs unless this is neither `production` nor `test` and stdout is a TTY, in which case logs are pretty. |
 
 The Redis connect and command timeouts (300ms), the disabled offline queue, the partial TTL (30 seconds), and the jitter span (0 through 30 inclusive) are constants. They are not environment variables.
 
@@ -168,9 +171,9 @@ The Redis connect and command timeouts (300ms), the disabled offline queue, the 
 | One provider down | 200 | `MISS`, then `HIT` for 30s | `stored`, then `fresh` | yes, 30s | The failed id is in `X-Providers-Failed`. A hit inside the window does not retry it. |
 | Both providers down | 502 | absent | absent | no | Body `error.code` is `PROVIDERS_UNAVAILABLE`. `details.providersFailed` lists both ids. |
 | Both providers down, Redis down | 502 | absent | absent | no | The bypass warning is logged, then the handler throws. No `X-Cache` header. |
-| Corrupt payload | 200 | `MISS` | `refreshed_corrupt` | overwrite | Warn `cache payload corrupt; refreshing`. The next request is `HIT`. |
+| Corrupt payload | 200 | `MISS` | `refreshed_corrupt` | overwrite | Warn `cache payload failed validation`. The next request is `HIT`. |
 | `failProvider` set, the other provider returns | 200 | `BYPASS` | `fault_injection` | no | No Redis warning. The named id is in `X-Providers-Failed`. |
-| Bad query | 400 | absent | absent | no | `INVALID_QUERY`. `details.errors` names the field. |
+| Bad query | 400 | absent | absent | no | `INVALID_QUERY`. `details.issues` names the field. |
 | Unknown path | 404 | absent | absent | no | `NOT_FOUND`, message `No route for GET /path`. |
 | Unhandled error | 500 | absent | absent | no | `INTERNAL`, message `Unexpected error`. The stack is in the log. |
 

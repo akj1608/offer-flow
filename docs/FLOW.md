@@ -47,7 +47,7 @@ sequenceDiagram
 
 Both providers returned, so the reason is `stored` and the TTL is 900 seconds plus a uniform jitter of 0 through 30 seconds. One provider returned and the other failed, so the reason is still `stored` and the TTL is 30 seconds. The stored document is the full merge. `minPrice`, `maxPrice`, and `sort` are applied to the leader's own response after the write, and they are not written into the key.
 
-`X-Offers-Before-Dedupe` and `X-Offers-After-Dedupe` are the merge counts. `X-Providers-Ok` lists the providers that returned, `atlas` then `nimbus`, with no spaces. The failed header is an empty string when both returned.
+`X-Offers-Before-Dedupe` and `X-Offers-After-Dedupe` are the merge counts. `X-Providers-Ok` lists the providers that returned, `atlas` then `nimbus`, with no spaces. The failed header is `-` when both returned.
 
 Singleflight sits around this path. The in-process map is updated before the leader awaits Redis. Another request for the same key that arrives during the fan-out waits on the same promise. The leader still reports `MISS`. The waiter reports `COALESCED` and `joined_inflight`, then applies its own filter and sort to the shared document. Send the second request after the first has returned when the observation you want is `HIT`.
 
@@ -75,7 +75,7 @@ sequenceDiagram
   API-->>Client: 200 X-Cache HIT and X-Cache-Age
 ```
 
-`X-Cache` is `HIT`. `X-Cache-Reason` is `fresh`. `X-Cache-Age` is the whole seconds since `storedAt`, truncated, and at least 0. `meta.cache.ageSeconds` repeats it. Provider headers and dedupe headers are taken from the document, so a hit still reports a provider that failed at fill time.
+`X-Cache` is `HIT`. `X-Cache-Reason` is `fresh`. `X-Cache-Age` is the whole seconds since `storedAt`, truncated, and at least 0. `meta.cache` repeats the status and `meta.cacheAgeSeconds` repeats the age. Provider headers and dedupe headers are taken from the document, so a hit still reports a provider that failed at fill time. `meta.cacheTtlSeconds` on a hit is the time left, not the TTL that was written.
 
 A payload that fails validation leaves this path. It is the corrupt refresh in `ARCHITECTURE.md`: fan-out, overwrite, `MISS`, reason `refreshed_corrupt`.
 
@@ -164,7 +164,7 @@ Identity:
 | atlas | Oberoi New Delhi | The Oberoi | Delhi | `delhi:the-oberoi` | 9250 |
 | nimbus | The Oberoi | The Oberoi | Delhi | `delhi:the-oberoi` | 8600 |
 
-Two guests sit inside the base rate, so `nightlyCharged` equals the base rate. Totals are the nightly rate times two nights.
+Two guests sit inside the base rate, so the charged `nightlyRate` equals the catalog rate. `totalPrice` is that rate times two nights.
 
 | Provider | Nightly charged | Total |
 | --- | --- | --- |
@@ -179,19 +179,21 @@ The card the client receives:
 | --- | --- |
 | `hotelId` | `delhi:the-oberoi` |
 | `name` | The Oberoi |
-| `listedName` | The Oberoi |
 | `city` | Delhi |
 | `stars` | 5 |
 | `guestRating` | 9.4 |
-| `provider` | `nimbus`, Nimbus Stays |
+| `provider` | `nimbus` |
+| `providerName` | Nimbus Stays |
 | `nightlyRate` | 8600 |
-| `nightlyCharged` | 8600 |
 | `nights` | 2 |
 | `guests` | 2 |
-| `total` | 17200 |
+| `totalPrice` | 17200 |
 | `currency` | INR |
+| `commissionPct` | 12 |
 | `savingsVsNext` | 1300 |
-| `alternatives[0]` | Atlas Beds, listed name Oberoi New Delhi, total 18500 |
+| `alternatives[0]` | `atlas`, Atlas Beds, `totalPrice` 18500, `guestRating` 9.2, `commissionPct` 10 |
+
+Atlas listed the building as Oberoi New Delhi. That string is not on the alternative object. The shared `hotelId` is the merge. `commissionPct` is stored and is not read by the comparator. Nimbus also has the higher commission on this card, so the commission trap is the Sunder Nagar House case in `ARCHITECTURE.md`, not this one.
 
 The ratings do not decide this card. The totals differ. They are on the quote because a tie uses them.
 
@@ -215,14 +217,14 @@ flowchart TD
   providerId --> card
 ```
 
-Equal totals fall through to `guestRating`. Equal ratings fall through to provider id, `atlas` before `nimbus`. The rest of the group becomes `alternatives`, already in that order. `savingsVsNext` uses `alternatives[0].total - total`.
+Equal totals fall through to `guestRating`. Equal ratings fall through to provider id, `atlas` before `nimbus`. The rest of the group becomes `alternatives`, already in that order. `savingsVsNext` uses `alternatives[0].totalPrice - totalPrice`.
 
 Three guests show the rounding order. Each guest past two adds 15% of the base nightly rate. The nightly figure is rounded to the rupee, then multiplied by nights.
 
 ```
 extra = max(0, guests - 2)
-nightlyCharged = round(nightlyRate * (1 + 0.15 * extra))
-total = nightlyCharged * nights
+nightlyRate = round(baseNightlyRate * (1 + 0.15 * extra))
+totalPrice = nightlyRate * nights
 ```
 
 | Guests | Factor | Nimbus nightly | Nimbus total | Atlas nightly | Atlas total |
@@ -232,4 +234,4 @@ total = nightlyCharged * nights
 
 `8600 * 1.15` is 9890 exactly. `9250 * 1.15` is 10637.5, which rounds half away from zero to 10638. Times two nights, Atlas is 21276. Multiplying 10637.5 by two nights first and rounding afterwards would yield 21275. The service rounds the nightly rate first, so the Atlas total for three guests and two nights is 21276. Nimbus still wins. `savingsVsNext` is `21276 - 19780 = 1496`.
 
-Both quotes are priced with this rule before the comparator runs. Comparison uses `total`, not the base nightly rate.
+Both quotes are priced with this rule before the comparator runs. Comparison uses `totalPrice`.

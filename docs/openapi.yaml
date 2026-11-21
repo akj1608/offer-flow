@@ -1,194 +1,314 @@
 openapi: 3.0.3
 info:
-  title: Hotel Offer Orchestrator
-  version: 1.0.0
+  title: Offer Desk
+  version: "1.0.0"
   description: |
-    Search Atlas Beds and Nimbus Stays, keep the cheaper quote for each hotel,
-    and cache the merged list in Redis. Price filters are applied after the cache read.
-    The JSON on the wire matches this document. Response headers repeat `meta.cache`.
+    Hotel offer orchestrator. One Fastify process searches Atlas Beds (`atlas`)
+    and Nimbus Stays (`nimbus`), prices both with the same occupancy rule, keeps
+    the lower guest total for each hotel, and caches the merged list in Redis.
+
+    Redis is the only network dependency. The providers are in-process mocks.
+    Callers are not authenticated. `security` is an empty list for that reason.
+
+    `GET /` is the Offer Desk HTML page and is outside this document.
+    Unknown paths return 404 with the `Error` schema, code `NOT_FOUND`,
+    message `No route for GET /path`.
+
+    On `GET /v1/offers`, response headers are the wire contract.
+    `meta.cache`, `meta.cacheReason`, `meta.cacheKey`, and `meta.cacheAgeSeconds`
+    repeat them. Price filters and `sort` run after the cache read and are not
+    part of the cache key `offers:v1:{city}:{checkIn}:{checkOut}:{guests}:inr`.
+
+    `commissionPct` is on the quote and is not an input to the ranking.
+    Optimizing it would pick a worse price for the traveller. Sunder Nagar House
+    is that case: Atlas totals 8000 at 5 percent, Nimbus totals 9000 at 25 percent,
+    and the card is Atlas.
+
+    An unfiltered Delhi search merges 10 quotes into 6 hotels. The example below
+    is the Oberoi card from that merge: Nimbus at 17200, Atlas alternative at 18500,
+    `savingsVsNext` 1300. The example counts describe that one card so the body
+    stays consistent. A live Delhi response uses 10 and 6.
+security: []
 servers:
   - url: http://127.0.0.1:4781
+    description: Local default
+tags:
+  - name: health
+    description: Fail-open process and Redis ping
+  - name: providers
+    description: Registered hotel providers and cities
+  - name: offers
+    description: Search, merge, and cache
 paths:
   /health:
     get:
-      summary: Process and Redis health
+      tags: [health]
       operationId: getHealth
+      summary: Process and Redis health
+      description: |
+        Always HTTP 200. `status` is `ok` when Redis answers PING inside the
+        300ms command timeout, and `degraded` when it does not. Readiness does
+        not require Redis. Search is built to run without it.
       responses:
         "200":
-          description: Always 200. status is degraded when Redis is down.
+          description: Redis is up (`ok`) or unreachable (`degraded`).
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/XRequestId"
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/Health"
-              example:
-                status: ok
-                service: hotel-offer-orchestrator
-                redis:
-                  ok: true
-                  latencyMs: 1
-                uptimeSeconds: 12
+              examples:
+                up:
+                  summary: Redis answered
+                  value:
+                    status: ok
+                    service: hotel-offer-orchestrator
+                    redis:
+                      ok: true
+                      latencyMs: 1
+                    uptimeSeconds: 12
+                down:
+                  summary: Redis did not answer
+                  value:
+                    status: degraded
+                    service: hotel-offer-orchestrator
+                    redis:
+                      ok: false
+                      latencyMs: 300
+                      error: connect ECONNREFUSED 127.0.0.1:6379
+                      code: ECONNREFUSED
+                    uptimeSeconds: 12
+        "500":
+          $ref: "#/components/responses/Internal"
   /v1/providers:
     get:
-      summary: Mock providers and cities
+      tags: [providers]
       operationId: listProviders
+      summary: List providers and cities
+      description: |
+        Atlas Beds is registered first, Nimbus Stays second.
+        `hotels` is the catalog row count for that provider.
+        Cities are the canonical catalog cities, Delhi first.
       responses:
         "200":
-          description: Catalog summary
+          description: Provider stats and cities.
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/XRequestId"
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/ProviderIndex"
+              example:
+                providers:
+                  - id: atlas
+                    name: Atlas Beds
+                    hotels: 12
+                  - id: nimbus
+                    name: Nimbus Stays
+                    hotels: 12
+                cities:
+                  - id: delhi
+                    name: Delhi
+                  - id: mumbai
+                    name: Mumbai
+                  - id: bengaluru
+                    name: Bengaluru
+                  - id: goa
+                    name: Goa
+        "500":
+          $ref: "#/components/responses/Internal"
   /v1/offers:
     get:
-      summary: Search hotel offers
+      tags: [offers]
       operationId: searchOffers
+      summary: Search merged hotel offers
+      description: |
+        Validates the query, reads Redis, and on a miss fans out to both providers.
+        Occupancy pricing runs before dedupe. The winner is the lower `totalPrice`.
+        Ties break to the higher `guestRating`, then to provider id ascending.
+
+        `X-Cache` is `HIT`, `MISS`, `BYPASS`, or `COALESCED`.
+        A Redis outage still returns 200 with `BYPASS` and reason `redis_unreachable`.
+        `failProvider` skips Redis entirely and returns `BYPASS` / `fault_injection`.
+        Both providers failing returns 502, writes nothing, and sets no `X-Cache` header.
       parameters:
-        - in: query
-          name: city
-          required: true
-          schema: { type: string, minLength: 2, maxLength: 40, example: delhi }
-        - in: query
-          name: checkIn
-          schema: { type: string, format: date, example: "2026-11-22" }
-          description: UTC. Defaults to tomorrow when omitted.
-        - in: query
-          name: checkOut
-          schema: { type: string, format: date, example: "2026-11-24" }
-          description: UTC. Defaults to two nights after check-in.
-        - in: query
-          name: guests
-          schema: { type: integer, minimum: 1, maximum: 8, default: 2 }
-        - in: query
-          name: minPrice
-          schema: { type: integer, minimum: 0 }
-          description: Inclusive filter on the total stay price, applied after the cache read.
-        - in: query
-          name: maxPrice
-          schema: { type: integer, minimum: 0 }
-        - in: query
-          name: sort
-          schema: { type: string, enum: [price, rating, stars], default: price }
-        - in: query
-          name: failProvider
-          schema: { type: string, enum: [atlas, nimbus] }
-          description: Fault injection. Bypasses Redis in both directions. Reason is fault_injection.
-        - in: header
-          name: X-Request-Id
-          schema: { type: string, maxLength: 80, pattern: "^[\\w.-]{1,80}$" }
+        - $ref: "#/components/parameters/City"
+        - $ref: "#/components/parameters/CheckIn"
+        - $ref: "#/components/parameters/CheckOut"
+        - $ref: "#/components/parameters/Guests"
+        - $ref: "#/components/parameters/MinPrice"
+        - $ref: "#/components/parameters/MaxPrice"
+        - $ref: "#/components/parameters/Sort"
+        - $ref: "#/components/parameters/FailProvider"
+        - $ref: "#/components/parameters/XRequestId"
       responses:
         "200":
-          description: Merged offers. A provider outage that is not total is still 200.
+          description: |
+            Merged offers after the price filter and sort.
+            An empty `offers` array is a successful search and is cached.
           headers:
             X-Cache:
-              schema: { type: string, enum: [HIT, MISS, BYPASS, COALESCED] }
+              $ref: "#/components/headers/XCache"
             X-Cache-Reason:
-              schema:
-                type: string
-                enum:
-                  - fresh
-                  - stored
-                  - refreshed_corrupt
-                  - refreshed_stale
-                  - redis_unreachable
-                  - fault_injection
-                  - joined_inflight
+              $ref: "#/components/headers/XCacheReason"
             X-Cache-Key:
-              schema: { type: string }
+              $ref: "#/components/headers/XCacheKey"
             X-Cache-Age:
-              description: Present on HIT. Seconds since the value was stored.
-              schema: { type: integer }
+              $ref: "#/components/headers/XCacheAge"
             X-Offers-Before-Dedupe:
-              schema: { type: integer }
+              $ref: "#/components/headers/XOffersBeforeDedupe"
             X-Offers-After-Dedupe:
-              schema: { type: integer }
+              $ref: "#/components/headers/XOffersAfterDedupe"
             X-Providers-Ok:
-              schema: { type: string, example: atlas,nimbus }
+              $ref: "#/components/headers/XProvidersOk"
             X-Providers-Failed:
-              schema: { type: string, example: "-" }
+              $ref: "#/components/headers/XProvidersFailed"
             X-Request-Id:
-              schema: { type: string }
+              $ref: "#/components/headers/XRequestId"
             X-Response-Time-Ms:
-              schema: { type: integer }
+              $ref: "#/components/headers/XResponseTimeMs"
             Cache-Control:
-              schema: { type: string, example: no-store }
+              $ref: "#/components/headers/CacheControl"
+            Server-Timing:
+              $ref: "#/components/headers/ServerTiming"
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/SearchResponse"
-              example:
-                query:
-                  city: Delhi
-                  cityId: delhi
-                  checkIn: "2026-11-22"
-                  checkOut: "2026-11-24"
-                  nights: 2
-                  guests: 2
-                  currency: INR
-                  minPrice: null
-                  maxPrice: null
-                  sort: price
-                meta:
-                  cache: MISS
-                  cacheReason: stored
-                  cacheKey: offers:v1:delhi:2026-11-22:2026-11-24:2:inr
-                  cacheAgeSeconds: null
-                  cacheTtlSeconds: 912
-                  offersBeforeDedupe: 10
-                  offersAfterDedupe: 6
-                  returned: 6
-                  providersQueried: [atlas, nimbus]
-                  providersOk: [atlas, nimbus]
-                  providersFailed: []
-                  tookMs: 140
-                  requestId: req-123
-                offers:
-                  - hotelId: delhi:the-oberoi
-                    name: The Oberoi
-                    city: Delhi
-                    stars: 5
-                    guestRating: 9.4
-                    board: breakfast
-                    refundable: true
-                    amenities: [pool, spa, club-lounge]
-                    nights: 2
-                    guests: 2
-                    nightlyRate: 8600
-                    totalPrice: 17200
-                    currency: INR
-                    provider: nimbus
-                    providerName: Nimbus Stays
-                    providerHotelId: nb-dl-8841
-                    commissionPct: 12
-                    savingsVsNext: 1300
-                    alternatives:
-                      - provider: atlas
-                        providerName: Atlas Beds
-                        providerHotelId: atl-dl-440
-                        nightlyRate: 9250
-                        totalPrice: 18500
-                        guestRating: 9.2
-                        commissionPct: 10
+              examples:
+                delhiOberoiMiss:
+                  summary: Oberoi card, cache miss
+                  description: |
+                    Nimbus wins The Oberoi at 17200. Atlas at 18500 is the alternative.
+                    savingsVsNext is 1300. Counts here are this pair.
+                    A live Delhi search reports offersBeforeDedupe 10 and offersAfterDedupe 6.
+                  value:
+                    query:
+                      city: Delhi
+                      cityId: delhi
+                      checkIn: "2026-11-22"
+                      checkOut: "2026-11-24"
+                      nights: 2
+                      guests: 2
+                      currency: INR
+                      minPrice: null
+                      maxPrice: null
+                      sort: price
+                    meta:
+                      cache: MISS
+                      cacheReason: stored
+                      cacheKey: offers:v1:delhi:2026-11-22:2026-11-24:2:inr
+                      cacheAgeSeconds: null
+                      cacheTtlSeconds: 914
+                      offersBeforeDedupe: 2
+                      offersAfterDedupe: 1
+                      returned: 1
+                      providersQueried: [atlas, nimbus]
+                      providersOk: [atlas, nimbus]
+                      providersFailed: []
+                      tookMs: 140
+                      requestId: 8f3c1a0e-6b2d-4c9a-9f1e-2a7b6c5d4e30
+                    offers:
+                      - hotelId: delhi:the-oberoi
+                        name: The Oberoi
+                        city: Delhi
+                        stars: 5
+                        guestRating: 9.4
+                        board: breakfast
+                        refundable: true
+                        amenities: [pool, spa, club-lounge]
+                        nights: 2
+                        guests: 2
+                        nightlyRate: 8600
+                        totalPrice: 17200
+                        currency: INR
+                        provider: nimbus
+                        providerName: Nimbus Stays
+                        providerHotelId: nb-dl-8841
+                        commissionPct: 12
+                        savingsVsNext: 1300
+                        alternatives:
+                          - provider: atlas
+                            providerName: Atlas Beds
+                            providerHotelId: atl-dl-440
+                            nightlyRate: 9250
+                            totalPrice: 18500
+                            guestRating: 9.2
+                            commissionPct: 10
+                delhiOberoiHit:
+                  summary: The same card served from Redis
+                  description: |
+                    Providers are not called. X-Cache-Age is present.
+                    cacheTtlSeconds is the time remaining, not the TTL that was written.
+                  value:
+                    query:
+                      city: Delhi
+                      cityId: delhi
+                      checkIn: "2026-11-22"
+                      checkOut: "2026-11-24"
+                      nights: 2
+                      guests: 2
+                      currency: INR
+                      minPrice: null
+                      maxPrice: null
+                      sort: price
+                    meta:
+                      cache: HIT
+                      cacheReason: fresh
+                      cacheKey: offers:v1:delhi:2026-11-22:2026-11-24:2:inr
+                      cacheAgeSeconds: 3
+                      cacheTtlSeconds: 911
+                      offersBeforeDedupe: 2
+                      offersAfterDedupe: 1
+                      returned: 1
+                      providersQueried: [atlas, nimbus]
+                      providersOk: [atlas, nimbus]
+                      providersFailed: []
+                      tookMs: 4
+                      requestId: 1b7e9c44-0a55-4d2e-8c11-6f0a9d2e4b70
+                    offers:
+                      - hotelId: delhi:the-oberoi
+                        name: The Oberoi
+                        city: Delhi
+                        stars: 5
+                        guestRating: 9.4
+                        board: breakfast
+                        refundable: true
+                        amenities: [pool, spa, club-lounge]
+                        nights: 2
+                        guests: 2
+                        nightlyRate: 8600
+                        totalPrice: 17200
+                        currency: INR
+                        provider: nimbus
+                        providerName: Nimbus Stays
+                        providerHotelId: nb-dl-8841
+                        commissionPct: 12
+                        savingsVsNext: 1300
+                        alternatives:
+                          - provider: atlas
+                            providerName: Atlas Beds
+                            providerHotelId: atl-dl-440
+                            nightlyRate: 9250
+                            totalPrice: 18500
+                            guestRating: 9.2
+                            commissionPct: 10
         "400":
-          description: Invalid query. No X-Cache header.
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ErrorBody"
-              example:
-                error:
-                  code: INVALID_QUERY
-                  message: Search query is invalid
-                  details:
-                    issues:
-                      - path: city
-                        message: Required
-                  requestId: req-123
+          $ref: "#/components/responses/InvalidQuery"
         "502":
-          description: Every provider failed. No X-Cache header. The key is not written.
+          description: |
+            Both providers failed. The key was not written.
+            Cache headers are not set, because the handler throws before them.
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/XRequestId"
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/ErrorBody"
+                $ref: "#/components/schemas/Error"
               example:
                 error:
                   code: PROVIDERS_UNAVAILABLE
@@ -196,61 +316,352 @@ paths:
                   details:
                     providersFailed:
                       - provider: atlas
-                        message: down
+                        message: timed out
                       - provider: nimbus
-                        message: down
-                  requestId: req-123
+                        message: timed out
+                  requestId: 3c2a1f0e-4b5d-6a7e-8f90-1a2b3c4d5e6f
+        "500":
+          $ref: "#/components/responses/Internal"
 components:
+  parameters:
+    City:
+      name: city
+      in: query
+      required: true
+      description: |
+        2–40 characters after trim. Letters, spaces, periods, apostrophes, and hyphens.
+        Slugged, then passed through the city alias table.
+        `New Delhi` and `delhi` both become city id `delhi` and display name Delhi.
+        `Bangalore` becomes Bengaluru. `Bombay` becomes Mumbai.
+      schema:
+        type: string
+        minLength: 2
+        maxLength: 40
+        pattern: "^[A-Za-z][A-Za-z .'-]*$"
+      example: delhi
+    CheckIn:
+      name: checkIn
+      in: query
+      required: false
+      description: |
+        Stay start, `YYYY-MM-DD`, a real calendar date.
+        Absent or empty means tomorrow in UTC.
+        Cannot be before today UTC, and cannot be more than 365 days out.
+      schema:
+        type: string
+        format: date
+        pattern: "^\\d{4}-\\d{2}-\\d{2}$"
+      example: "2026-11-22"
+    CheckOut:
+      name: checkOut
+      in: query
+      required: false
+      description: |
+        Stay end, `YYYY-MM-DD`, strictly after `checkIn`.
+        Absent or empty means two nights after check-in.
+        The stay cannot exceed 30 nights. `nights` is the calendar-day difference.
+      schema:
+        type: string
+        format: date
+        pattern: "^\\d{4}-\\d{2}-\\d{2}$"
+      example: "2026-11-24"
+    Guests:
+      name: guests
+      in: query
+      required: false
+      description: |
+        Guest count. The nightly rate covers 1 or 2. Each guest past 2 adds 15%
+        to the nightly rate, rounded to the rupee, then multiplied by nights.
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 8
+        default: 2
+    MinPrice:
+      name: minPrice
+      in: query
+      required: false
+      description: |
+        Inclusive lower bound on `totalPrice`, in INR.
+        Applied after the cache read. Omitted from the cache key.
+      schema:
+        type: integer
+        minimum: 0
+    MaxPrice:
+      name: maxPrice
+      in: query
+      required: false
+      description: |
+        Inclusive upper bound on the winner `totalPrice`, in INR.
+        Applied after the cache read. Alternatives may sit above this bound.
+      schema:
+        type: integer
+        minimum: 0
+    Sort:
+      name: sort
+      in: query
+      required: false
+      description: |
+        Result order, applied after the cache read.
+        `price` is `totalPrice` ascending, then name.
+        `rating` is `guestRating` descending, then `totalPrice`, then name.
+        `stars` is stars descending, then `totalPrice`, then name.
+      schema:
+        type: string
+        enum: [price, rating, stars]
+        default: price
+    FailProvider:
+      name: failProvider
+      in: query
+      required: false
+      description: |
+        Fault injection. The named provider fails immediately with message `injected failure`.
+        The request does not read or write Redis, so the demo cannot poison the key.
+        Response cache status is `BYPASS`, reason `fault_injection`.
+      schema:
+        type: string
+        enum: [atlas, nimbus]
+    XRequestId:
+      name: X-Request-Id
+      in: header
+      required: false
+      description: |
+        Echoed when it matches `^[\w.-]{1,80}$`. Otherwise the server generates a UUID.
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 80
+        pattern: "^[\\w.-]+$"
+  headers:
+    XCache:
+      description: Cache outcome for this response.
+      required: true
+      schema:
+        type: string
+        enum: [HIT, MISS, BYPASS, COALESCED]
+      example: MISS
+    XCacheReason:
+      description: |
+        Why `X-Cache` has that value.
+        `fresh` is a valid document. `stored` is a write, including a 30 second partial write.
+        `refreshed_corrupt` overwrote a payload that failed the schema.
+        `refreshed_stale` overwrote a document older than its own TTL.
+        `redis_unreachable` means the command failed and nothing was written.
+        `fault_injection` means `failProvider` skipped Redis.
+        `joined_inflight` means this caller shared a leader whose result was `MISS` or `HIT`.
+      required: true
+      schema:
+        type: string
+        enum:
+          - fresh
+          - stored
+          - refreshed_corrupt
+          - refreshed_stale
+          - redis_unreachable
+          - fault_injection
+          - joined_inflight
+      example: stored
+    XCacheKey:
+      description: "Redis key. Shape `offers:v1:{city}:{checkIn}:{checkOut}:{guests}:inr`."
+      required: true
+      schema:
+        type: string
+      example: offers:v1:delhi:2026-11-22:2026-11-24:2:inr
+    XCacheAge:
+      description: |
+        Whole seconds since `storedAt`, truncated, minimum 0.
+        Present on `HIT` only.
+      required: false
+      schema:
+        type: integer
+        minimum: 0
+      example: 3
+    XOffersBeforeDedupe:
+      description: Quote count that entered dedupe, before the price filter.
+      required: true
+      schema:
+        type: integer
+        minimum: 0
+      example: 2
+    XOffersAfterDedupe:
+      description: Merged hotel count, before the price filter.
+      required: true
+      schema:
+        type: integer
+        minimum: 0
+      example: 1
+    XProvidersOk:
+      description: |
+        Comma-separated provider ids that returned quotes, `atlas` before `nimbus`,
+        no spaces. `-` when none.
+      required: true
+      schema:
+        type: string
+      example: atlas,nimbus
+    XProvidersFailed:
+      description: |
+        Comma-separated provider ids that failed, `atlas` before `nimbus`,
+        no spaces. `-` when none.
+      required: true
+      schema:
+        type: string
+      example: "-"
+    XRequestId:
+      description: Request id echoed from the client or generated as a UUID.
+      required: true
+      schema:
+        type: string
+      example: 8f3c1a0e-6b2d-4c9a-9f1e-2a7b6c5d4e30
+    XResponseTimeMs:
+      description: Handler elapsed time, integer milliseconds. Same value as `meta.tookMs`.
+      required: true
+      schema:
+        type: integer
+        minimum: 0
+      example: 140
+    CacheControl:
+      description: Search responses are not for shared or browser caches. The Redis cache is server-side.
+      required: true
+      schema:
+        type: string
+        enum: [no-store]
+      example: no-store
+    ServerTiming:
+      description: "`app` duration in milliseconds, the same integer as `X-Response-Time-Ms`."
+      required: true
+      schema:
+        type: string
+      example: app;dur=140
+  responses:
+    InvalidQuery:
+      description: The query failed validation. Cache and providers were not called. No `X-Cache` header.
+      headers:
+        X-Request-Id:
+          $ref: "#/components/headers/XRequestId"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            error:
+              code: INVALID_QUERY
+              message: Search query is invalid
+              details:
+                issues:
+                  - path: city
+                    message: city must be at least 2 characters
+              requestId: 3c2a1f0e-4b5d-6a7e-8f90-1a2b3c4d5e6f
+    Internal:
+      description: Unhandled error. The response message is fixed. The stack stays in the log. No `X-Cache` header.
+      headers:
+        X-Request-Id:
+          $ref: "#/components/headers/XRequestId"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            error:
+              code: INTERNAL
+              message: Unexpected error
+              details: null
+              requestId: 3c2a1f0e-4b5d-6a7e-8f90-1a2b3c4d5e6f
   schemas:
     Health:
       type: object
+      additionalProperties: false
       required: [status, service, redis, uptimeSeconds]
       properties:
-        status: { type: string, enum: [ok, degraded] }
-        service: { type: string, example: hotel-offer-orchestrator }
+        status:
+          type: string
+          enum: [ok, degraded]
+          description: "`ok` when `redis.ok` is true. `degraded` when it is false. HTTP status stays 200."
+        service:
+          type: string
+          example: hotel-offer-orchestrator
         redis:
           type: object
+          additionalProperties: false
           required: [ok, latencyMs]
           properties:
-            ok: { type: boolean }
-            latencyMs: { type: integer }
-            error: { type: string }
-            code: { type: string }
-        uptimeSeconds: { type: integer }
+            ok:
+              type: boolean
+            latencyMs:
+              type: integer
+              minimum: 0
+            error:
+              type: string
+            code:
+              type: string
+              description: Syscall or client code. `ECONNREFUSED` when nothing is listening. `REDIS_UNAVAILABLE` when the error has no code.
+        uptimeSeconds:
+          type: integer
+          minimum: 0
     ProviderIndex:
       type: object
+      additionalProperties: false
       required: [providers, cities]
       properties:
         providers:
           type: array
           items:
             type: object
+            additionalProperties: false
             required: [id, name, hotels]
             properties:
-              id: { type: string, enum: [atlas, nimbus] }
-              name: { type: string }
-              hotels: { type: integer }
+              id:
+                type: string
+                enum: [atlas, nimbus]
+              name:
+                type: string
+              hotels:
+                type: integer
+                minimum: 0
         cities:
           type: array
           items:
             type: object
+            additionalProperties: false
             required: [id, name]
             properties:
-              id: { type: string }
-              name: { type: string }
+              id:
+                type: string
+              name:
+                type: string
     Alternative:
       type: object
+      additionalProperties: false
       required: [provider, providerName, providerHotelId, nightlyRate, totalPrice, guestRating, commissionPct]
+      description: A losing quote kept on the winner card. The provider's listed name is not repeated here.
       properties:
-        provider: { type: string, enum: [atlas, nimbus] }
-        providerName: { type: string }
-        providerHotelId: { type: string }
-        nightlyRate: { type: integer }
-        totalPrice: { type: integer }
-        guestRating: { type: number }
-        commissionPct: { type: number }
-    HotelOffer:
+        provider:
+          type: string
+          enum: [atlas, nimbus]
+        providerName:
+          type: string
+        providerHotelId:
+          type: string
+          example: atl-dl-440
+        nightlyRate:
+          type: integer
+          minimum: 0
+          description: Occupancy-adjusted nightly rate in INR.
+        totalPrice:
+          type: integer
+          minimum: 0
+          description: Stay total in INR.
+          example: 18500
+        guestRating:
+          type: number
+          minimum: 0
+          example: 9.2
+        commissionPct:
+          type: number
+          description: Stored on the quote. The comparator does not read it.
+          example: 10
+    Offer:
       type: object
+      additionalProperties: false
       required:
         - hotelId
         - name
@@ -272,48 +683,140 @@ components:
         - savingsVsNext
         - alternatives
       properties:
-        hotelId: { type: string, example: delhi:the-oberoi }
-        name: { type: string }
-        city: { type: string }
-        stars: { type: integer, enum: [3, 4, 5] }
-        guestRating: { type: number }
-        board: { type: string, enum: [room-only, breakfast, half-board] }
-        refundable: { type: boolean }
-        amenities: { type: array, items: { type: string } }
-        nights: { type: integer }
-        guests: { type: integer }
-        nightlyRate: { type: integer }
-        totalPrice: { type: integer }
-        currency: { type: string, enum: [INR] }
-        provider: { type: string, enum: [atlas, nimbus] }
-        providerName: { type: string }
-        providerHotelId: { type: string }
-        commissionPct: { type: number }
-        savingsVsNext: { type: integer }
-        alternatives:
+        hotelId:
+          type: string
+          description: Canonical city slug, a colon, and the hotel slug.
+          example: delhi:the-oberoi
+        name:
+          type: string
+          description: Listed name of the winning quote.
+          example: The Oberoi
+        city:
+          type: string
+          description: Canonical display city.
+          example: Delhi
+        stars:
+          type: integer
+          enum: [3, 4, 5]
+        guestRating:
+          type: number
+          minimum: 0
+          description: Rating from the winning quote. Ratings are not averaged.
+          example: 9.4
+        board:
+          type: string
+          enum: [room-only, breakfast, half-board]
+        refundable:
+          type: boolean
+        amenities:
           type: array
           items:
+            type: string
+        nights:
+          type: integer
+          minimum: 1
+          maximum: 30
+        guests:
+          type: integer
+          minimum: 1
+          maximum: 8
+        nightlyRate:
+          type: integer
+          minimum: 0
+          description: Occupancy-adjusted nightly rate in INR. The catalog base rate, after the 15% rule and rounding.
+          example: 8600
+        totalPrice:
+          type: integer
+          minimum: 0
+          description: Guest total in INR. `nightlyRate` times nights. Comparison uses this number.
+          example: 17200
+        currency:
+          type: string
+          enum: [INR]
+        provider:
+          type: string
+          enum: [atlas, nimbus]
+        providerName:
+          type: string
+          example: Nimbus Stays
+        providerHotelId:
+          type: string
+          example: nb-dl-8841
+        commissionPct:
+          type: number
+          description: Stored on the winning quote. Ranking ignores it.
+          example: 12
+        savingsVsNext:
+          type: integer
+          minimum: 0
+          description: |
+            Runner-up `totalPrice` minus winner `totalPrice`, in INR.
+            Zero when `alternatives` is empty, and zero when the totals tie.
+          example: 1300
+        alternatives:
+          type: array
+          description: Losing quotes in winner-comparator order. The first is the runner-up.
+          items:
             $ref: "#/components/schemas/Alternative"
+    ProviderFailure:
+      type: object
+      additionalProperties: false
+      required: [provider, message]
+      properties:
+        provider:
+          type: string
+          enum: [atlas, nimbus]
+        message:
+          type: string
+          description: "`timed out`, `injected failure`, or the error text truncated to 200 characters."
     SearchResponse:
       type: object
+      additionalProperties: false
       required: [query, meta, offers]
       properties:
         query:
           type: object
+          additionalProperties: false
           required: [city, cityId, checkIn, checkOut, nights, guests, currency, minPrice, maxPrice, sort]
           properties:
-            city: { type: string }
-            cityId: { type: string }
-            checkIn: { type: string, format: date }
-            checkOut: { type: string, format: date }
-            nights: { type: integer }
-            guests: { type: integer }
-            currency: { type: string, enum: [INR] }
-            minPrice: { type: integer, nullable: true }
-            maxPrice: { type: integer, nullable: true }
-            sort: { type: string, enum: [price, rating, stars] }
+            city:
+              type: string
+              example: Delhi
+            cityId:
+              type: string
+              description: Slug used in the cache key.
+              example: delhi
+            checkIn:
+              type: string
+              format: date
+            checkOut:
+              type: string
+              format: date
+            nights:
+              type: integer
+              minimum: 1
+              maximum: 30
+            guests:
+              type: integer
+              minimum: 1
+              maximum: 8
+            currency:
+              type: string
+              enum: [INR]
+            minPrice:
+              type: integer
+              nullable: true
+              minimum: 0
+            maxPrice:
+              type: integer
+              nullable: true
+              minimum: 0
+            sort:
+              type: string
+              enum: [price, rating, stars]
         meta:
           type: object
+          additionalProperties: false
           required:
             - cache
             - cacheReason
@@ -329,47 +832,92 @@ components:
             - tookMs
             - requestId
           properties:
-            cache: { type: string, enum: [HIT, MISS, BYPASS, COALESCED] }
+            cache:
+              type: string
+              enum: [HIT, MISS, BYPASS, COALESCED]
+              description: Same value as `X-Cache`.
             cacheReason:
               type: string
-              enum: [fresh, stored, refreshed_corrupt, refreshed_stale, redis_unreachable, fault_injection, joined_inflight]
-            cacheKey: { type: string }
-            cacheAgeSeconds: { type: integer, nullable: true }
-            cacheTtlSeconds: { type: integer, nullable: true }
-            offersBeforeDedupe: { type: integer }
-            offersAfterDedupe: { type: integer }
-            returned: { type: integer }
+              enum:
+                - fresh
+                - stored
+                - refreshed_corrupt
+                - refreshed_stale
+                - redis_unreachable
+                - fault_injection
+                - joined_inflight
+              description: Same value as `X-Cache-Reason`.
+            cacheKey:
+              type: string
+            cacheAgeSeconds:
+              type: integer
+              nullable: true
+              minimum: 0
+              description: Set on `HIT`. Null otherwise.
+            cacheTtlSeconds:
+              type: integer
+              nullable: true
+              minimum: 0
+              description: |
+                TTL written on a miss. Remaining seconds on a hit.
+                Null when this response did not read or write a document.
+            offersBeforeDedupe:
+              type: integer
+              minimum: 0
+            offersAfterDedupe:
+              type: integer
+              minimum: 0
+            returned:
+              type: integer
+              minimum: 0
+              description: "`offers.length` after the price filter."
             providersQueried:
               type: array
-              items: { type: string, enum: [atlas, nimbus] }
+              items:
+                type: string
+                enum: [atlas, nimbus]
             providersOk:
               type: array
-              items: { type: string, enum: [atlas, nimbus] }
+              items:
+                type: string
+                enum: [atlas, nimbus]
             providersFailed:
               type: array
               items:
-                type: object
-                required: [provider, message]
-                properties:
-                  provider: { type: string, enum: [atlas, nimbus] }
-                  message: { type: string }
-            tookMs: { type: integer }
-            requestId: { type: string }
+                $ref: "#/components/schemas/ProviderFailure"
+            tookMs:
+              type: integer
+              minimum: 0
+            requestId:
+              type: string
         offers:
           type: array
           items:
-            $ref: "#/components/schemas/HotelOffer"
-    ErrorBody:
+            $ref: "#/components/schemas/Offer"
+    Error:
       type: object
+      additionalProperties: false
       required: [error]
       properties:
         error:
           type: object
+          additionalProperties: false
           required: [code, message, details, requestId]
           properties:
             code:
               type: string
               enum: [INVALID_QUERY, NOT_FOUND, PROVIDERS_UNAVAILABLE, INTERNAL]
-            message: { type: string }
-            details: {}
-            requestId: { type: string }
+            message:
+              type: string
+              description: |
+                `Search query is invalid`, `No route for METHOD /path`,
+                `Every hotel provider failed`, or `Unexpected error`.
+            details:
+              type: object
+              nullable: true
+              additionalProperties: true
+              description: |
+                `issues` on `INVALID_QUERY`. `providersFailed` on `PROVIDERS_UNAVAILABLE`.
+                `null` on `NOT_FOUND` and `INTERNAL`.
+            requestId:
+              type: string

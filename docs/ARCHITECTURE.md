@@ -88,7 +88,7 @@ public/
 5. A valid document is filtered and sorted in the request and returned as `HIT`. Providers are not called.
 6. A miss, a corrupt document, or a Redis error fans out. `pricing.ts` runs on every returned quote. `dedupe.ts` merges them.
 7. The leader writes Redis only when the write rules below allow it.
-8. `payload.ts` copies cache status, reason, key, and age into both the headers and `meta.cache`.
+8. The route copies cache status, reason, key, and age onto the response headers and onto `meta` (`cache`, `cacheReason`, `cacheKey`, `cacheAgeSeconds`).
 
 Price filters and the result sort run per request, after the shared document exists. Joiners on one flight can carry different `minPrice`, `maxPrice`, and `sort`. Those values are not in the key, and they do not split the flight.
 
@@ -98,31 +98,32 @@ Price filters and the result sort run per request, after the shared document exi
 
 If Redis cannot be reached, the search still returns offers. The response carries `X-Cache: BYPASS` and `X-Cache-Reason: redis_unreachable`. The process logs a warning. The warning includes the host, the port, and the error code (`ECONNREFUSED` when nothing is listening). Operators then check that port. The log line is specified in `OPERATIONS.md`.
 
-The user request does not wait on Redis retries. The client disables the offline queue, so a command issued while Redis is down fails immediately instead of sitting in a buffer. Connect timeout and command timeout are each 300ms. Those timeouts are constants in `redis-cache.ts`, not environment variables. A dead socket is replaced once. The client may also reconnect in the background for a later request. The failed request does not block on that reconnect.
+The offline queue is disabled, so a command is not parked until Redis returns. Connect timeout and command timeout are each 300ms. Those timeouts are constants in `redis-cache.ts`, not environment variables. `maxRetriesPerRequest` is 1, and a dead socket is replaced once. If that second attempt fails, the search proceeds. The request does not block on the background reconnect loop.
 
 A `GET` that fails is enough to take the bypass path. The leader then skips `SET`. If `GET` was a miss and the following `SET` fails, the process logs the same warning and still answers `BYPASS`. The offers are the live fan-out. The key remains absent.
 
-The host and port in the log are parsed from `REDIS_URL`. Userinfo from the URL is never logged. When the error carries no code, the field is `UNKNOWN`.
+The host and port in the log are parsed from `REDIS_URL`. Userinfo from the URL is never logged. When the error carries no code, the field is `REDIS_UNAVAILABLE`. `ioredis` is configured with `enableOfflineQueue: false`, `connectTimeout` and `commandTimeout` of 300ms, and `maxRetriesPerRequest: 1`. A dead client is replaced and the command is attempted once more. A second failure becomes the bypass. The request does not sit in the reconnect loop.
 
 ### 2. The cheaper stay wins
 
 The winner is the lower guest total after occupancy pricing. A tie breaks to the higher `guestRating`, then to the provider id in ascending order (`atlas` before `nimbus`). Commission is stored on the quote as `commissionPct` and is not an input to the ranking.
 
-Optimizing commission would pick a worse price for the traveller, which this service refuses to do. In the Oberoi pair from `FLOW.md`, that choice would sell the Atlas stay at ₹18,500 ahead of the Nimbus stay at ₹17,200.
+Optimizing commission would pick a worse price for the traveller, which this service refuses to do. The catalog case is Sunder Nagar House in Delhi, two nights, two guests. Atlas is ₹4,000 a night at 5% commission, total ₹8,000. Nimbus is ₹4,500 a night at 25% commission, total ₹9,000. The card is Atlas. A desk that maximized `commissionPct` would sell the Nimbus stay and charge the traveller ₹1,000 more.
 
-The winner card keeps the losing quotes on `alternatives`, in the same comparator order. `savingsVsNext` is the runner-up total minus the winner total, in rupees. It is `null` when the hotel was quoted once. It is `0` when the totals tie and the rating or the provider id decided the winner. Ratings are not averaged across providers. The card shows the winner's stars and `guestRating`.
+The winner card keeps the losing quotes on `alternatives`, in the same comparator order. `savingsVsNext` is the runner-up `totalPrice` minus the winner `totalPrice`. It is `0` when the hotel was quoted once, and `0` when the totals tie and the rating or the provider id decided the winner. Ratings are not averaged across providers. The card shows the winner's stars and `guestRating`. The card `name` is the winning quote's listed name. The alias is visible in `hotelId`, not as a separate listed-name field.
 
 ### 3. Identity is an alias table plus a slug
 
 A hotel id is a canonical city plus a slugged hotel name: `delhi:the-oberoi`.
 
-Normalization:
+Normalization, in `identity.ts`:
 
-1. Trim, then collapse internal whitespace to a single space.
-2. Look up the city in the city table, case-insensitive, exact match.
-3. Look up the provider's listed hotel name in the hotel table, case-insensitive, exact match.
-4. Slug the canonical hotel name: lowercase, replace each run of characters outside `a-z` and `0-9` with one hyphen, strip hyphens at the ends.
-5. Slug the canonical city by lowercasing it and removing spaces. `New Delhi` is already rewritten to `Delhi` before this step, so the key segment is `delhi`.
+1. Slug the raw string: trim, lowercase, turn `&` into ` and `, replace every other run outside `a-z` and `0-9` with one hyphen, and strip hyphens at the ends.
+2. If that slug is in the city table, replace it. `new-delhi` and `newdelhi` both become `delhi`.
+3. If the hotel-name slug is in the hotel table, replace it. `oberoi-new-delhi` becomes `the-oberoi`.
+4. `hotelId` is `{citySlug}:{nameSlug}`.
+
+The cache key uses the city slug, so `New Delhi`, `new delhi`, and `Delhi` share `delhi`.
 
 City aliases:
 
@@ -144,9 +145,9 @@ Hotel aliases:
 
 `The Oberoi` slugs to `the-oberoi`. `Taj Mahal Hotel` slugs to `taj-mahal-hotel`. `The Taj Mahal Palace` slugs to `the-taj-mahal-palace`. `ITC Windsor` slugs to `itc-windsor`. `Fort Aguada` slugs to `fort-aguada`.
 
-A name that misses the table stays as the normalized spelling. `The Oberoi New Delhi` does not match `Oberoi New Delhi`, so it does not merge with `The Oberoi`. Fuzzy matching is out of scope because a false merge is worse than a duplicate listing.
+A name that misses the table keeps its own slug. `The Oberoi New Delhi` slugs to `the-oberoi-new-delhi`, which is not `oberoi-new-delhi`, so it does not merge with `The Oberoi`. Fuzzy matching is out of scope because a false merge is worse than a duplicate listing.
 
-A quote whose canonical city differs from the query city is dropped before dedupe. The mocks already filter by city. The drop stays in front of a future supplier adapter so a stray city cannot merge into the searched city on a shared name.
+The mock returns only rows whose canonical city equals the query. Dedupe then groups that list.
 
 ### 4. Filters stay off the cache key
 
@@ -164,11 +165,11 @@ The bounds are inclusive and apply to the winner's stay total. A card inside the
 
 | `sort` | Order |
 | --- | --- |
-| `price` (default) | total ascending, `guestRating` descending, `hotelId` ascending |
-| `rating` | `guestRating` descending, total ascending, `hotelId` ascending |
-| `stars` | stars descending, total ascending, `guestRating` descending, `hotelId` ascending |
+| `price` (default) | `totalPrice` ascending, `name` ascending |
+| `rating` | `guestRating` descending, `totalPrice` ascending, `name` ascending |
+| `stars` | stars descending, `totalPrice` ascending, `name` ascending |
 
-`hotelId` order is lexicographic on the id string. The same document then produces the same order on a hit and on a miss.
+`name` order is `localeCompare`. This sort is not the winner comparator. The winner comparator still breaks ties on `guestRating`, then provider id. The same document then produces the same card order on a hit and on a miss.
 
 ### 5. One occupancy rule, applied before compare
 
@@ -176,35 +177,35 @@ The nightly rate covers 1 or 2 guests. Each guest past 2 adds 15% to the nightly
 
 ```
 extra = max(0, guests - 2)
-nightlyCharged = round(nightlyRate * (1 + 0.15 * extra))
-total = nightlyCharged * nights
+nightlyRate = round(baseNightlyRate * (1 + 0.15 * extra))
+totalPrice = nightlyRate * nights
 ```
 
-`round` is half away from zero for positive amounts, which is JavaScript `Math.round` on a positive number. Base catalog rates are whole rupees, so 1 or 2 guests need no rounding. The stay total is not rounded a second time. `FLOW.md` runs the rule on The Oberoi, including a 3-guest case where rounding and then multiplying differs from multiplying and then rounding.
+`round` is half away from zero for positive amounts, which is JavaScript `Math.round` on a positive number. Base catalog rates are whole rupees, so 1 or 2 guests need no rounding. The stay total is not rounded a second time. On the wire, `nightlyRate` is this adjusted rate and `totalPrice` is the stay total. `FLOW.md` runs the rule on The Oberoi, including a 3-guest case where rounding and then multiplying differs from multiplying and then rounding.
 
 ### 6. One provider interface, two in-process mocks
 
 ```ts
 interface HotelProvider {
   readonly id: "atlas" | "nimbus";
-  readonly name: string;
-  search(input: ProviderSearch): Promise<ProviderQuote[]>;
+  readonly displayName: string;
+  search(query: { city: string; failProvider: "atlas" | "nimbus" | null }, signal: AbortSignal): Promise<RawOffer[]>;
 }
 ```
 
-`ProviderSearch` carries the canonical city, `checkIn`, `checkOut`, and `guests`. `ProviderQuote` carries `providerId`, `listedName`, `city`, `stars`, `guestRating`, `nightlyRate`, and `currency: "INR"`.
+The query carries the city slug and the fault-injection flag. Dates, nights, and guests stay in the orchestrator. A `RawOffer` is a catalog row: listed name, city, stars, `guestRating`, base `nightlyRate`, `commissionPct`, board, refundable, amenities, and `providerHotelId`.
 
-Atlas Beds is registered first, Nimbus Stays second. Header lists and the `providers.ok` / `providers.failed` arrays follow that order. Winner selection uses the price comparator, not registration order.
+Atlas Beds is registered first, Nimbus Stays second. `providersOk` and `providersFailed` follow that order. Winner selection uses the price comparator, not registration order.
 
-The mock waits `MOCK_LATENCY_MS` (default 120) and then returns the catalog rows for that city. The base rate does not depend on `guests`. The fan-out races each call against `PROVIDER_TIMEOUT_MS` (default 800). A timeout fails that provider and clears its latency timer. The other provider is left to finish. The fan-out settles when both have succeeded or failed. Wall time is the slower of the two, capped by the timeout.
+The mock waits `MOCK_LATENCY_MS` (default 120) and then returns the catalog rows for that city. The base rate does not depend on `guests`. The fan-out races each call against `PROVIDER_TIMEOUT_MS` (default 800) with an `AbortSignal`. A timeout fails that provider with message `timed out` and clears its timer. The other provider is left to finish. Wall time is the slower of the two, capped by the timeout.
 
-`failProvider` fails the named provider immediately with log code `INJECTED` and does not start its timer. An organic timeout logs `TIMEOUT`. Any other throw logs `PROVIDER_ERROR`. The log is info, message `provider failed`, fields `provider` and `code`.
+`failProvider` makes that mock throw `injected failure` before the latency sleep. Any provider failure logs a warning, message `provider fan-out was partial or failed`, with the `providersFailed` array.
 
 ### 7. Singleflight is in-process
 
-Concurrent misses for one key share one fan-out. The map lives in the orchestrator: cache key to the leader's promise. It is updated synchronously, before the leader awaits, so two misses cannot both walk past the check and both call the providers. The `finally` block deletes the entry. The map stores no offer bytes after the promise settles. A restart drops it. Keys that Redis still holds are hits on the next request.
+Concurrent misses for one key share one fan-out. The map lives in the orchestrator: cache key to the leader's promise. It is updated synchronously, before the caller awaits, so two misses cannot both walk past the check and both call the providers. The entry is deleted when the promise settles. The map stores no offer bytes after that. A restart drops it. Keys that Redis still holds are hits on the next request.
 
-The leader's cache status is `MISS` when it completes a fill, or `BYPASS` when Redis cannot be used. Joiners get `COALESCED` and `X-Cache-Reason: joined_inflight`. They reuse the leader's merged document, then apply their own filter and sort. A joiner keeps the leader's HTTP status. On a 200 it filters the shared document for its own query. On a 502 it returns the same error body, with `X-Cache: COALESCED`. If a waiter attached while the leader was still reading and the read returns a valid document, the leader reports `HIT`, the waiter reports `COALESCED`, and neither calls the providers.
+The leader reports `MISS` when it writes, `HIT` when the document is already valid, or `BYPASS` when Redis cannot be used. A waiter reports `COALESCED` and `joined_inflight` when that leader result is `MISS` or `HIT`, then applies its own filter and sort. A waiter on a bypass flight reports `BYPASS` and `redis_unreachable`, the same status as the leader. A flight that throws, because both providers failed, rejects for every waiter. The error handler answers 502 and does not set `X-Cache`.
 
 This does not coordinate across replicas. A multi-instance lock (`SET NX`) is a follow-up, not something the code pretends to do. Two replicas can both miss and both write. The last writer wins. Both documents are valid merges for the same key. `failProvider` does not join the flight and does not write, so a demo failure cannot land in the key the other replica is filling.
 
@@ -216,15 +217,17 @@ This path is separate from an organic partial failure. An organic single-provide
 
 ### 9. Corrupt payloads are refreshed
 
-A Redis value is corrupt when it is not JSON, when `version` is not `1`, when a required field is missing, when `offers` is not an array, when `storedAt` is not a parseable time, or when the document's city, dates, guests, or currency disagree with the key. Unknown extra fields are ignored.
+A Redis value is corrupt when it is not JSON or when it fails the payload schema: `version` must be `1`, `storedAt` a string, `ttlSeconds` a positive integer, the provider arrays present, and `offers` an array of hotel cards. Unknown fields are stripped by the schema parse and the value is accepted.
 
-A corrupt value is a miss. The leader fans out, and on a successful merge it overwrites the key. The response is `X-Cache: MISS` and `X-Cache-Reason: refreshed_corrupt`. The process logs a warning, message `cache payload corrupt; refreshing`, field `key`. The raw bytes stay out of the log.
+A corrupt value is a miss. The leader fans out, and on a successful merge it overwrites the key. The response is `X-Cache: MISS` and `X-Cache-Reason: refreshed_corrupt`. The process logs a warning, message `cache payload failed validation`, field `cacheKey`. The raw bytes stay out of the log.
+
+A document whose age is greater than or equal to its own `ttlSeconds` is not corrupt. It is stale. The response is `MISS` / `refreshed_stale`, and the key is overwritten. Redis `EX` usually drops the key first. `refreshed_stale` covers a value that is still present past the TTL recorded inside it.
 
 If that fan-out fails for both providers, the handler throws before any cache write. The HTTP status is 502 `PROVIDERS_UNAVAILABLE`, and `X-Cache` is not set. The corrupt bytes are left in place. The next request tries the refresh again. `refreshed_corrupt` is reserved for a response that actually overwrote the key.
 
 ### 10. Health is fail-open
 
-`GET /health` returns HTTP 200 with `status` `ok` or `degraded`. `ok` means the Redis ping succeeded. `degraded` means it did not, and `redis.ok` is false. The ping uses the same 300ms command timeout. Readiness does not require Redis, because search is designed to run without it. A load balancer that only checks the status code keeps sending traffic while the pill is down.
+`GET /health` returns HTTP 200. `status` is `ok` when `redis.ok` is true and `degraded` when the ping failed. The body also carries `service` (`hotel-offer-orchestrator`), `redis.latencyMs`, `redis.code` when the ping failed, and `uptimeSeconds`. The ping uses the same 300ms command timeout. Readiness does not require Redis, because search is designed to run without it. A load balancer that only checks the status code keeps sending traffic while the pill is down.
 
 Health reports the ping result in the body. It does not emit `cache bypassed because redis is unreachable` on every scrape. The search path emits that warning when a user request actually bypasses the cache.
 
@@ -243,38 +246,39 @@ The value is UTF-8 JSON. `redis-cli GET` can print it. Raw provider payloads are
   "version": 1,
   "storedAt": "2026-11-21T06:40:12.000Z",
   "ttlSeconds": 914,
-  "city": "Delhi",
-  "checkIn": "2026-11-22",
-  "checkOut": "2026-11-24",
-  "guests": 2,
-  "currency": "INR",
-  "providers": { "ok": ["atlas", "nimbus"], "failed": [] },
-  "dedupe": { "before": 2, "after": 1 },
+  "offersBeforeDedupe": 10,
+  "providersQueried": ["atlas", "nimbus"],
+  "providersOk": ["atlas", "nimbus"],
+  "providersFailed": [],
   "offers": [
     {
       "hotelId": "delhi:the-oberoi",
       "name": "The Oberoi",
       "city": "Delhi",
-      "listedName": "The Oberoi",
       "stars": 5,
       "guestRating": 9.4,
-      "nightlyRate": 8600,
-      "nightlyCharged": 8600,
+      "board": "breakfast",
+      "refundable": true,
+      "amenities": ["pool", "spa", "club-lounge"],
       "nights": 2,
       "guests": 2,
-      "total": 17200,
+      "nightlyRate": 8600,
+      "totalPrice": 17200,
       "currency": "INR",
-      "provider": { "id": "nimbus", "name": "Nimbus Stays" },
+      "provider": "nimbus",
+      "providerName": "Nimbus Stays",
+      "providerHotelId": "nb-dl-8841",
+      "commissionPct": 12,
       "savingsVsNext": 1300,
       "alternatives": [
         {
-          "provider": { "id": "atlas", "name": "Atlas Beds" },
-          "listedName": "Oberoi New Delhi",
-          "stars": 5,
-          "guestRating": 9.1,
+          "provider": "atlas",
+          "providerName": "Atlas Beds",
+          "providerHotelId": "atl-dl-440",
           "nightlyRate": 9250,
-          "nightlyCharged": 9250,
-          "total": 18500
+          "totalPrice": 18500,
+          "guestRating": 9.2,
+          "commissionPct": 10
         }
       ]
     }
@@ -282,14 +286,14 @@ The value is UTF-8 JSON. `redis-cli GET` can print it. Raw provider payloads are
 }
 ```
 
-`storedAt` is UTC. `ttlSeconds` is the TTL that was sent to Redis on that write. This document is the worked Oberoi pair: both providers returned, so the TTL is 914 (900 plus 14 seconds of jitter) and `dedupe.after` matches `offers.length`. `providers` records who returned and who failed, in registration order within each list. `dedupe.before` is the quote count that entered dedupe. `dedupe.after` is the merged card count. `offers` is the full merge, before price filters and before result sort. Each element is the offer object from the API, including `alternatives` and `savingsVsNext`. A catalog row beyond this pair is another element in `offers`. The arithmetic is in `FLOW.md`.
+`storedAt` is UTC. `ttlSeconds` is the TTL sent to Redis on that write. A full Delhi stay stores ten quotes merged into six cards (`offersBeforeDedupe` 10). The element above is The Oberoi. The other five cards use the same object. `offers` is the full merge, before price filters and before result sort. `providersFailed` entries are `{ provider, message }`. The arithmetic for this card is in `FLOW.md`.
 
 Write rules:
 
 | Outcome | Write | TTL |
 | --- | --- | --- |
 | Both providers returned (including a legitimate empty list) | `SET` key payload `EX` ttl | `CACHE_TTL_SECONDS` plus a uniform integer from 0 through 30 inclusive. Default 900, so the stored TTL is 900–930. |
-| One provider failed, the other returned | `SET` | Exactly 30 seconds. Jitter is not added. `CACHE_TTL_SECONDS` does not apply. |
+| One provider failed, the other returned | `SET` | `min(30, CACHE_TTL_SECONDS)`. Jitter is not added. The reason is still `stored`. |
 | Both providers failed | none | — |
 | `failProvider` set | none | — |
 | Redis error on `GET` or `SET` | none | — |
@@ -297,14 +301,14 @@ Write rules:
 
 A hit inside the 30-second partial window does not retry the failed provider. The short TTL is how the hole closes. After expiry the next request is a miss and fans out again.
 
-`X-Offers-Before-Dedupe` and `X-Offers-After-Dedupe` repeat `dedupe.before` and `dedupe.after`. They describe the merge, not the filtered page. `meta.returned` is the count after the filter, and it is per request.
+`X-Offers-Before-Dedupe` and `X-Offers-After-Dedupe` repeat `offersBeforeDedupe` and `offersAfterDedupe`. They describe the merge, not the filtered page. `meta.returned` is the count after the filter, and it is per request. On a hit, `meta.cacheTtlSeconds` is the remaining TTL, not the original write.
 
 ## HTTP
 
 | Method and path | Response |
 | --- | --- |
 | `GET /` | Offer Desk UI (`text/html`) |
-| `GET /health` | `{ "status": "ok" \| "degraded", "redis": "up" \| "down" }` |
+| `GET /health` | `{ status, service, redis: { ok, latencyMs, code? }, uptimeSeconds }` |
 | `GET /v1/providers` | `{ providers: [{ id, name, hotels }], cities: [{ id, name }] }` |
 | `GET /v1/offers` | `{ query, meta, offers }` |
 
@@ -313,8 +317,8 @@ A hit inside the 30-second partial window does not retry the failed provider. Th
 | Param | Rule |
 | --- | --- |
 | `city` | Required. Trimmed, 2–40 characters, `^[A-Za-z][A-Za-z .'-]*$`. Then the city alias table. |
-| `checkIn`, `checkOut` | `YYYY-MM-DD`, real calendar dates. Absent or empty means tomorrow UTC, and checkout two nights after check-in. On 2026-11-21 UTC the defaults are `2026-11-22` and `2026-11-24`. Checkout must be after check-in. `nights` is the difference in calendar days. |
-| `guests` | Integer 1–8, default 2. The text must match `^[0-9]+$`. |
+| `checkIn`, `checkOut` | `YYYY-MM-DD`, real calendar dates. Absent or empty means tomorrow UTC, and checkout two nights after check-in. On 2026-11-21 UTC the defaults are `2026-11-22` and `2026-11-24`. Check-in cannot be before today UTC and cannot be more than 365 days out. Checkout must be after check-in. The stay cannot exceed 30 nights. |
+| `guests` | Integer 1–8, default 2. |
 | `minPrice`, `maxPrice` | Optional integers, rupees, `>= 0`, inclusive on the winner total. If both are set, `minPrice` must be `<= maxPrice`. |
 | `sort` | `price` (default), `rating`, or `stars`. |
 | `failProvider` | Optional `atlas` or `nimbus`. |
@@ -329,8 +333,8 @@ Search headers. They are the wire contract. PowerShell `Invoke-WebRequest` reads
 | `X-Cache-Reason` | `fresh`, `stored`, `refreshed_corrupt`, `refreshed_stale`, `redis_unreachable`, `fault_injection`, `joined_inflight` |
 | `X-Cache-Key` | The key above |
 | `X-Cache-Age` | Whole seconds since `storedAt`, truncated, minimum 0. Present on `HIT` only. |
-| `X-Offers-Before-Dedupe` | `dedupe.before` |
-| `X-Offers-After-Dedupe` | `dedupe.after` |
+| `X-Offers-Before-Dedupe` | `offersBeforeDedupe` |
+| `X-Offers-After-Dedupe` | `offersAfterDedupe` |
 | `X-Providers-Ok` | Comma-separated ids, no spaces. `-` when none. |
 | `X-Providers-Failed` | Same shape as `X-Providers-Ok`. |
 | `X-Request-Id` | The client value when it matches `^[\w.-]{1,80}$`. Otherwise a new UUID. |
@@ -380,16 +384,20 @@ Validation runs before the cache and the providers, so a 400 has no `X-Cache` he
 
 | Field | Meaning |
 | --- | --- |
-| `requestId` | Same value as `X-Request-Id` |
-| `city` | Canonical display name (`Delhi`, not the raw query) |
-| `checkIn`, `checkOut`, `nights`, `guests` | Resolved stay |
-| `currency` | `INR` |
-| `sort` | Resolved sort |
-| `cache.status`, `cache.reason`, `cache.key` | Same as the headers |
-| `cache.ageSeconds` | Integer on `HIT`, otherwise `null` |
-| `cache.ttlSeconds` | TTL of the document read or written, otherwise `null` |
-| `providers.ok`, `providers.failed` | Same ids as the headers, as arrays |
-| `dedupe.before`, `dedupe.after` | Same integers as the dedupe headers |
-| `returned` | `offers.length` after the filter |
+| `query.city` | Canonical display name (`Delhi`) |
+| `query.cityId` | City slug used in the cache key |
+| `query.checkIn`, `checkOut`, `nights`, `guests`, `currency`, `sort` | Resolved stay |
+| `query.minPrice`, `query.maxPrice` | The bounds, or `null` |
+| `meta.cache` | Same string as `X-Cache` |
+| `meta.cacheReason` | Same string as `X-Cache-Reason` |
+| `meta.cacheKey` | Same string as `X-Cache-Key` |
+| `meta.cacheAgeSeconds` | Integer on `HIT`, otherwise `null` |
+| `meta.cacheTtlSeconds` | TTL written, or the remaining TTL on a hit. `null` when nothing was stored. |
+| `meta.offersBeforeDedupe`, `meta.offersAfterDedupe` | Same integers as the dedupe headers |
+| `meta.returned` | `offers.length` after the filter |
+| `meta.providersOk` | Provider ids that returned |
+| `meta.providersFailed` | `{ provider, message }` for each failure |
+| `meta.tookMs` | Same integer as `X-Response-Time-Ms` |
+| `meta.requestId` | Same value as `X-Request-Id` |
 
 A winner offer includes `alternatives` and `savingsVsNext`. Field names and the Delhi example are in `openapi.yaml`.
