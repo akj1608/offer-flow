@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build
+      - name: Verify MISS then HIT against a live server
+        env:
+          REDIS_URL: redis://127.0.0.1:6379
+          BASE_URL: http://127.0.0.1:4781
+          PORT: "4781"
+          HOST: 127.0.0.1
+          MOCK_LATENCY_MS: "0"
+          NODE_ENV: production
+          LOG_LEVEL: info
+        run: |
+          node dist/server.js > /tmp/api.log 2>&1 &
+          echo $! > /tmp/api.pid
+          for _ in $(seq 1 50); do
+            curl -sf http://127.0.0.1:4781/health && break
+            sleep 0.2
+          done
+          curl -sf http://127.0.0.1:4781/health
+          npm run verify:cache
+          kill "$(cat /tmp/api.pid)" || true

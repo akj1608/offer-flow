@@ -1,0 +1,28 @@
+services:
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  api:
+    build: .
+    ports:
+      - "4781:4781"
+    environment:
+      PORT: "4781"
+      HOST: "0.0.0.0"
+      REDIS_URL: redis://redis:6379
+      NODE_ENV: production
+      MOCK_LATENCY_MS: "120"
+      CACHE_TTL_SECONDS: "900"
+      PROVIDER_TIMEOUT_MS: "800"
+      LOG_LEVEL: info
+    depends_on:
+      redis:
+        condition: service_healthy

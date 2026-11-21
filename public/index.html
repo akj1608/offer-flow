@@ -1,0 +1,90 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="robots" content="noindex" />
+    <title>Offer Desk — Hotel Offer Orchestrator</title>
+    <link rel="icon" href="/favicon.svg" />
+    <link rel="stylesheet" href="/app.css" />
+  </head>
+  <body>
+    <a class="skip" href="#offers">Skip to offers</a>
+    <header class="top">
+      <div class="brand">
+        <p class="eyebrow">Hotel Offer Orchestrator</p>
+        <h1>Offer Desk</h1>
+        <p class="lede">Two suppliers, one stay. The cheaper quote is the one that stays on the card.</p>
+      </div>
+      <p id="redis-pill" class="pill" role="status">Checking Redis…</p>
+    </header>
+
+    <main class="layout">
+      <form id="search" class="panel">
+        <h2>Search</h2>
+        <label>
+          City
+          <select id="city" name="city">
+            <option value="Delhi">Delhi</option>
+            <option value="Mumbai">Mumbai</option>
+            <option value="Bengaluru">Bengaluru</option>
+            <option value="Goa">Goa</option>
+            <option value="Jaipur">Jaipur (no inventory)</option>
+          </select>
+        </label>
+        <label>
+          Check-in
+          <input id="check-in" name="checkIn" type="date" required />
+        </label>
+        <label>
+          Check-out
+          <input id="check-out" name="checkOut" type="date" required />
+        </label>
+        <label>
+          Guests
+          <input id="guests" name="guests" type="number" min="1" max="8" value="2" required />
+        </label>
+        <div class="pair">
+          <label>
+            Min total (INR)
+            <input id="min-price" name="minPrice" type="number" min="0" step="100" inputmode="numeric" />
+          </label>
+          <label>
+            Max total (INR)
+            <input id="max-price" name="maxPrice" type="number" min="0" step="100" inputmode="numeric" />
+          </label>
+        </div>
+        <label>
+          Sort
+          <select id="sort" name="sort">
+            <option value="price">Price, low to high</option>
+            <option value="rating">Guest rating</option>
+            <option value="stars">Stars</option>
+          </select>
+        </label>
+        <label>
+          Fault injection
+          <select id="fail-provider" name="failProvider">
+            <option value="">Neither provider</option>
+            <option value="atlas">Fail Atlas Beds</option>
+            <option value="nimbus">Fail Nimbus Stays</option>
+          </select>
+        </label>
+        <button id="submit" type="submit">Search offers</button>
+        <p class="hint">Dates are UTC. A second identical search should come back with <strong>X-Cache: HIT</strong> once Redis is up. Price filters are applied after the cache read.</p>
+      </form>
+
+      <section class="results">
+        <div id="banner" class="banner" hidden></div>
+        <div id="summary" class="summary" hidden></div>
+        <div id="offers" tabindex="-1"></div>
+        <section id="headers" class="headers" hidden>
+          <h2>Response headers</h2>
+          <p class="hint">The same fields PowerShell reads from <code>Invoke-WebRequest</code>. The JSON body repeats them so a client does not have to.</p>
+          <dl id="header-list"></dl>
+        </section>
+      </section>
+    </main>
+    <script src="/app.js"></script>
+  </body>
+</html>
